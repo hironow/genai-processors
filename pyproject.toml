@@ -76,6 +76,17 @@ pyink-use-majority-quotes = true
 requires = ["flit_core >=3.8,<4"]
 build-backend = "flit_core.buildapi"
 
+[dependency-groups]
+dev = [
+    "pytest-asyncio>=1.2.0",
+    "pytest>=8.4.2",
+    "pytest-cov>=7.0.0",
+    "pytest-mock>=3.15.1",
+    "fastapi[standard]>=0.116.2",
+    "websockets>=15.0.1",
+    "loguru>=0.7.3",
+]
+
 [tool.flit.module]
 name = "genai_processors"
 dir = "."
