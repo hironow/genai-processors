@@ -15,7 +15,7 @@ from real_world.agent import pipelines
 # ---------- Test helpers ----------
 
 
-async def _start_server(monkeypatch, stub_kind: str = "text", seq: list[str] | None = None):
+async def _start_server(monkeypatch, stub_kind: str = "text", seq: list[str] | None = None, delay: float = 0.0):
     """Start a WS server with a stubbed live pipeline.
 
     stub_kind: 'text' | 'binary' | 'tool_call' | 'error'
@@ -28,10 +28,13 @@ async def _start_server(monkeypatch, stub_kind: str = "text", seq: list[str] | N
 
         @processor.processor_function
         async def _stub_live(content):
-            # Drain inputs to simulate model consumption.
-            async for _ in content:
-                pass
+            # Consume until end_of_turn, then emit chunks
+            async for p in content:
+                if p.metadata.get("turn_complete"):
+                    break
             for s in chunks:
+                if delay > 0:
+                    await asyncio.sleep(delay)
                 yield content_api.ProcessorPart(s, role="model")
 
         monkeypatch.setattr(pipelines, "build_live_pipeline", lambda *a, **k: _stub_live)
@@ -40,8 +43,9 @@ async def _start_server(monkeypatch, stub_kind: str = "text", seq: list[str] | N
 
         @processor.processor_function
         async def _stub_live(content):
-            async for _ in content:
-                pass
+            async for p in content:
+                if p.metadata.get("turn_complete"):
+                    break
             yield content_api.ProcessorPart(b"\x89PNGtest", mimetype="image/png", role="model")
 
         monkeypatch.setattr(pipelines, "build_live_pipeline", lambda *a, **k: _stub_live)
@@ -50,10 +54,13 @@ async def _start_server(monkeypatch, stub_kind: str = "text", seq: list[str] | N
 
         @processor.processor_function
         async def _stub_live(content):
-            async for _ in content:
-                pass
+            # Emit a tool_call first, then wait for a tool_response in input and respond with text.
             yield content_api.ProcessorPart.from_function_call(name="sum", args={"a": 1, "b": 2}, role="model")
-            yield content_api.ProcessorPart("ok", role="model")
+            async for p in content:
+                if p.part.function_response is not None and p.part.function_response.name == "sum":
+                    v = p.part.function_response.response.get("value")
+                    yield content_api.ProcessorPart(f"ok:{v}", role="model")
+                    break
 
         monkeypatch.setattr(pipelines, "build_live_pipeline", lambda *a, **k: _stub_live)
 
@@ -61,8 +68,9 @@ async def _start_server(monkeypatch, stub_kind: str = "text", seq: list[str] | N
 
         @processor.processor_function
         async def _stub_live(content):
-            async for _ in content:
-                pass
+            async for p in content:
+                if p.metadata.get("turn_complete"):
+                    break
             # Force async-generator function shape while raising an error.
             if False:  # pragma: no cover
                 yield content_api.ProcessorPart("unreached", role="model")
@@ -80,7 +88,7 @@ async def _start_server(monkeypatch, stub_kind: str = "text", seq: list[str] | N
     return srv, url
 
 
-async def _rpc_roundtrip(url: str, req: dict[str, Any]):
+async def _rpc_roundtrip(url: str, req: dict[str, Any], *, timeout: float = 5.0):
     """Send a JSON-RPC request and collect notifications until final response.
 
     Returns: (notifications, final_message)
@@ -88,8 +96,12 @@ async def _rpc_roundtrip(url: str, req: dict[str, Any]):
     notes = []
     async with websockets.connect(url) as ws:
         await ws.send(json.dumps(req))
+        deadline = asyncio.get_event_loop().time() + timeout
         while True:
-            msg = json.loads(await ws.recv())
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError("timeout waiting for final JSON-RPC response")
+            msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=remaining))
             if "id" in msg and msg.get("id") == req.get("id"):
                 return notes, msg
             notes.append(msg)
@@ -155,6 +167,103 @@ async def test_chat_process_streaming_text(monkeypatch, seq):
 
 
 @pytest.mark.asyncio
+async def test_chat_process_suppress_whitespace(monkeypatch):
+    # given: server with whitespace and text mixed
+    srv, url = await _start_server(monkeypatch, stub_kind="text", seq=["", "A", "  ", "B", "\n", " "])
+    try:
+        req_id = 41
+        req = {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "method": "chat.process",
+            "params": {
+                "messages": [{"role": "user", "content": "hi"}],
+                "options": {"suppress_whitespace": True},
+            },
+        }
+        notes, resp = await _rpc_roundtrip(url, req)
+        texts = [n.get("params", {}).get("event", {}).get("text") for n in notes if n.get("method") == "chat.chunk"]
+        assert texts == ["A", "B"]
+        assert resp.get("result", {}).get("text") == "AB"
+    finally:
+        srv.close()
+        await srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_chat_process_coalesce_chars(monkeypatch):
+    # given: small tokens, coalesce by 3 chars
+    srv, url = await _start_server(monkeypatch, stub_kind="text", seq=["A", "B", "C", "D"])
+    try:
+        req_id = 42
+        req = {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "method": "chat.process",
+            "params": {
+                "messages": [{"role": "user", "content": "hi"}],
+                "options": {"coalesce_chars": 3},
+            },
+        }
+        notes, resp = await _rpc_roundtrip(url, req)
+        texts = [n.get("params", {}).get("event", {}).get("text") for n in notes if n.get("method") == "chat.chunk"]
+        assert texts == ["ABC", "D"]
+        assert resp.get("result", {}).get("text") == "ABCD"
+    finally:
+        srv.close()
+        await srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_chat_process_coalesce_time_combine(monkeypatch):
+    # given: small delay; time-based coalesce larger than delay, so combined
+    srv, url = await _start_server(monkeypatch, stub_kind="text", seq=["A", "B", "C"], delay=0.01)
+    try:
+        req_id = 43
+        req = {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "method": "chat.process",
+            "params": {
+                "messages": [{"role": "user", "content": "hi"}],
+                "options": {"coalesce_time_ms": 50},
+            },
+        }
+        notes, resp = await _rpc_roundtrip(url, req)
+        texts = [n.get("params", {}).get("event", {}).get("text") for n in notes if n.get("method") == "chat.chunk"]
+        # Expect a single combined chunk 'ABC' (timer fires once)
+        assert texts in (["ABC"], ["AB", "C"])  # allow slight timing variance
+        assert resp.get("result", {}).get("text") == "ABC"
+    finally:
+        srv.close()
+        await srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_chat_process_coalesce_time_split(monkeypatch):
+    # given: larger delay; time-based coalesce smaller than delay, so split each
+    srv, url = await _start_server(monkeypatch, stub_kind="text", seq=["A", "B", "C"], delay=0.06)
+    try:
+        req_id = 44
+        req = {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "method": "chat.process",
+            "params": {
+                "messages": [{"role": "user", "content": "hi"}],
+                "options": {"coalesce_time_ms": 30},
+            },
+        }
+        notes, resp = await _rpc_roundtrip(url, req)
+        texts = [n.get("params", {}).get("event", {}).get("text") for n in notes if n.get("method") == "chat.chunk"]
+        assert texts == ["A", "B", "C"]
+        assert resp.get("result", {}).get("text") == "ABC"
+    finally:
+        srv.close()
+        await srv.wait_closed()
+
+
+@pytest.mark.asyncio
 async def test_chat_process_streaming_binary(monkeypatch):
     # given: server with binary stub
     srv, url = await _start_server(monkeypatch, stub_kind="binary")
@@ -180,7 +289,7 @@ async def test_chat_process_streaming_binary(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_chat_process_streaming_tool_call_and_text(monkeypatch):
-    # given: server with tool_call then text
+    # given: server with tool_call then waits for tool_response
     srv, url = await _start_server(monkeypatch, stub_kind="tool_call")
     try:
         req = {
@@ -189,14 +298,38 @@ async def test_chat_process_streaming_tool_call_and_text(monkeypatch):
             "method": "chat.process",
             "params": {"messages": [{"role": "user", "content": "calc"}]},
         }
-        # when
-        notes, resp = await _rpc_roundtrip(url, req)
-
-        # then: first is tool_call, then text "ok"; final text == "ok"
-        evts = [n.get("params", {}).get("event", {}) for n in notes if n.get("method") == "chat.chunk"]
-        assert evts and evts[0].get("type") == "tool_call" and evts[0].get("name") == "sum"
-        assert any(e.get("type") == "text" and e.get("text") == "ok" for e in evts)
-        assert resp.get("result", {}).get("text") == "ok"
+        # when: connect manually to issue a tool_response mid-stream
+        async with websockets.connect(url) as ws:
+            await ws.send(json.dumps(req))
+            # Wait for tool_call notification
+            tool_seen = False
+            while True:
+                msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+                if msg.get("method") == "chat.chunk":
+                    evt = msg.get("params", {}).get("event", {})
+                    if evt.get("type") == "tool_call" and evt.get("name") == "sum":
+                        tool_seen = True
+                        break
+            assert tool_seen
+            # send tool_response
+            await ws.send(json.dumps({
+                "jsonrpc": "2.0",
+                "id": 333,
+                "method": "chat.tool_response",
+                "params": {"request_id": 3, "name": "sum", "response": {"value": 3}},
+            }))
+            # then: expect ack and final result ok:3
+            got_ack = False
+            final = None
+            for _ in range(50):
+                msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+                if msg.get("id") == 333:
+                    assert msg.get("result", {}).get("accepted") is True
+                    got_ack = True
+                if msg.get("id") == 3:
+                    final = msg
+                    break
+            assert got_ack and final and final.get("result", {}).get("text") == "ok:3"
     finally:
         srv.close()
         await srv.wait_closed()
@@ -281,8 +414,9 @@ async def test_reserved_substreams_are_filtered(monkeypatch):
     # given: stub that emits a reserved-status part and a default text
     @processor.processor_function
     async def _stub_live(content):
-        async for _ in content:
-            pass
+        async for p in content:
+            if p.metadata.get("turn_complete"):
+                break
         yield content_api.ProcessorPart("status log", role="model", substream_name=processor.STATUS_STREAM)
         yield content_api.ProcessorPart("ok", role="model")
 
@@ -314,8 +448,9 @@ async def test_metadata_is_json_sanitized(monkeypatch):
 
     @processor.processor_function
     async def _stub_live(content):
-        async for _ in content:
-            pass
+        async for p in content:
+            if p.metadata.get("turn_complete"):
+                break
         yield content_api.ProcessorPart("x", role="model", metadata={"meta": Meta(1)})
 
     monkeypatch.setattr(pipelines, "build_live_pipeline", lambda *a, **k: _stub_live)
@@ -340,8 +475,9 @@ async def test_concurrent_requests_same_connection(monkeypatch):
     # given: stub that emits two short chunks per request
     @processor.processor_function
     async def _stub_live(content):
-        async for _ in content:
-            pass
+        async for p in content:
+            if p.metadata.get("turn_complete"):
+                break
         yield content_api.ProcessorPart("A", role="model")
         yield content_api.ProcessorPart("B", role="model")
 
@@ -413,8 +549,9 @@ async def test_chat_cancel_stops_stream_and_errors_original(monkeypatch):
     # given: long-running stub that yields chunks with delay
     @processor.processor_function
     async def _stub_live(content):
-        async for _ in content:
-            pass
+        async for p in content:
+            if p.metadata.get("turn_complete"):
+                break
         for i in range(50):
             await asyncio.sleep(0.02)
             yield content_api.ProcessorPart(f"{i}", role="model")
