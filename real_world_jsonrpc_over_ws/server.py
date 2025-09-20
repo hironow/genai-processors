@@ -190,6 +190,15 @@ async def _handle_chat_process(
         resp = _rpc_response_ok(request_id, result)
         async with send_lock:
             await websocket.send(json.dumps(resp, ensure_ascii=False))
+    except asyncio.CancelledError:
+        # Respond to original request with a cancellation error and exit cleanly.
+        try:
+            resp = _rpc_response_error(request_id, -32800, "Request cancelled")
+            async with send_lock:
+                await websocket.send(json.dumps(resp, ensure_ascii=False))
+        except Exception:
+            pass
+        return
     except Exception as e:
         logger.exception("chat.process failed")
         err = _rpc_response_error(request_id, -32000, "chat.process failed", {"detail": str(e)})
@@ -200,7 +209,7 @@ async def _handle_chat_process(
 async def _connection_handler(websocket):
     logger.info("WS JSON-RPC: client connected: {}", getattr(websocket, "remote_address", None))
     send_lock = asyncio.Lock()
-    inflight: set[asyncio.Task] = set()
+    inflight: dict[Any, asyncio.Task] = {}
     try:
         async for raw in websocket:
             try:
@@ -222,9 +231,27 @@ async def _connection_handler(websocket):
 
             if method == "chat.process":
                 task = asyncio.create_task(_handle_chat_process(req_id, params, websocket, send_lock))
-                inflight.add(task)
-                # Cleanup on finish
-                task.add_done_callback(lambda t: inflight.discard(t))
+                if req_id is not None:
+                    inflight[req_id] = task
+                    # Cleanup mapping on finish
+                    def _done_cb(t: asyncio.Task, rid=req_id):
+                        inflight.pop(rid, None)
+                    task.add_done_callback(_done_cb)
+                # For None id, we still run the task without mapping
+                continue
+
+            if method == "chat.cancel":
+                target_id = params.get("request_id") if isinstance(params, dict) else None
+                if target_id is None:
+                    async with send_lock:
+                        await websocket.send(json.dumps(_rpc_response_error(req_id, -32602, "Invalid params: request_id required")))
+                    continue
+                task = inflight.get(target_id)
+                had = task is not None
+                if had:
+                    task.cancel()
+                async with send_lock:
+                    await websocket.send(json.dumps(_rpc_response_ok(req_id, {"cancelled": bool(had), "request_id": target_id})))
                 continue
 
             # Unknown method
@@ -234,10 +261,11 @@ async def _connection_handler(websocket):
     except websockets.exceptions.ConnectionClosed:
         logger.info("WS JSON-RPC: connection closed")
     finally:
-        for t in inflight:
+        # Cancel any remaining tasks
+        for t in list(inflight.values()):
             t.cancel()
         if inflight:
-            await asyncio.gather(*inflight, return_exceptions=True)
+            await asyncio.gather(*inflight.values(), return_exceptions=True)
 
 
 async def main(host: str = "127.0.0.1", port: int = 8765):
