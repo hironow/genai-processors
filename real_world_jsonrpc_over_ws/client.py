@@ -4,6 +4,7 @@ import asyncio
 import json
 from dataclasses import asdict
 from typing import Any
+import argparse
 
 import websockets
 
@@ -12,16 +13,28 @@ def _rpc_request(id_: Any, method: str, params: dict | None = None) -> dict:
     return {"jsonrpc": "2.0", "id": id_, "method": method, "params": params or {}}
 
 
-async def run_demo(url: str = "ws://127.0.0.1:8765"):
+async def run_demo(
+    url: str = "ws://127.0.0.1:8765",
+    *,
+    text: str = "Generative AI is transforming the world.",
+    request_id: int = 1,
+    suppress_whitespace: bool = False,
+    coalesce_chars: int = 0,
+    coalesce_time_ms: int = 0,
+):
     async with websockets.connect(url) as ws:
-        req_id = 1
         req = _rpc_request(
-            req_id,
+            request_id,
             "chat.process",
             {
                 "messages": [
-                    {"role": "user", "content": "Summarize: Generative AI is transforming the world."}
-                ]
+                    {"role": "user", "content": text}
+                ],
+                "options": {
+                    "suppress_whitespace": bool(suppress_whitespace),
+                    "coalesce_chars": int(coalesce_chars or 0),
+                    "coalesce_time_ms": int(coalesce_time_ms or 0),
+                },
             },
         )
         await ws.send(json.dumps(req, ensure_ascii=False))
@@ -35,7 +48,7 @@ async def run_demo(url: str = "ws://127.0.0.1:8765"):
             except Exception:
                 print(raw)
                 continue
-            if "id" in msg and msg.get("id") == req_id:
+            if "id" in msg and msg.get("id") == request_id:
                 if "error" in msg:
                     print("<- error:", json.dumps(msg.get("error"), ensure_ascii=False, indent=2))
                 else:
@@ -51,7 +64,24 @@ async def run_demo(url: str = "ws://127.0.0.1:8765"):
 
 
 if __name__ == "__main__":
-    asyncio.run(run_demo())
+    parser = argparse.ArgumentParser(description="JSON-RPC over WS demo client")
+    parser.add_argument("--url", default="ws://127.0.0.1:8765", help="WebSocket URL")
+    parser.add_argument("--text", default="Generative AI is transforming the world.", help="User message text")
+    parser.add_argument("--request-id", type=int, default=1, help="JSON-RPC request id")
+    parser.add_argument("--suppress-whitespace", action="store_true", help="Suppress whitespace-only text chunks")
+    parser.add_argument("--coalesce-chars", type=int, default=0, help="Coalesce text chunks by this many characters (0=off)")
+    parser.add_argument("--coalesce-time-ms", type=int, default=0, help="Coalesce text chunks by time in milliseconds (0=off)")
+    args = parser.parse_args()
+    asyncio.run(
+        run_demo(
+            args.url,
+            text=args.text,
+            request_id=args.request_id,
+            suppress_whitespace=args.suppress_whitespace,
+            coalesce_chars=args.coalesce_chars,
+            coalesce_time_ms=args.coalesce_time_ms,
+        )
+    )
 
 
 # Test-friendly helper that performs one chat.process and returns all chunks and final message.

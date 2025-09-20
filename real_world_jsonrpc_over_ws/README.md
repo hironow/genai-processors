@@ -36,6 +36,13 @@ Examples
 Run
 - Server: `python -m real_world_jsonrpc_over_ws.server`
 - Client demo: `python -m real_world_jsonrpc_over_ws.client`
+  - Flags (coalescer control):
+    - `--suppress-whitespace` — drop whitespace-only text chunks
+    - `--coalesce-chars N` — coalesce default-stream text roughly every N chars
+    - `--coalesce-time-ms N` — coalesce text by time (ms)
+  - Example:
+    - `python -m real_world_jsonrpc_over_ws.client --coalesce-chars 32`
+    - `python -m real_world_jsonrpc_over_ws.client --suppress-whitespace --coalesce-time-ms 50`
 
 Notes
 - Uses the same live pipeline as real_world/app, and filters reserved substreams (status/debug/caption).
