@@ -196,6 +196,13 @@ async def _handle_chat_process(
         except Exception:
             coalesce_time_ms = 0
 
+        logger.info(
+            "RPC chat.process opts: suppress_ws={} coalesce_chars={} coalesce_time_ms={}",
+            suppress_ws,
+            coalesce_chars,
+            coalesce_time_ms,
+        )
+
         # Aggregate plain-text on default stream for convenience result.text
         agg_text: list[str] = []
         coalesce_enabled = (coalesce_chars > 0) or (coalesce_time_ms > 0)
@@ -277,6 +284,9 @@ async def _handle_chat_process(
                     )
                     async with send_lock:
                         await websocket.send(json.dumps(note, ensure_ascii=False))
+                    logger.debug(
+                        "RPC chat.process: sent text chunk len={} id={}", len(t), request_id
+                    )
             else:
                 # Non-text event: flush pending coalesced text first
                 if coalesce_enabled:
@@ -287,6 +297,11 @@ async def _handle_chat_process(
                 )
                 async with send_lock:
                     await websocket.send(json.dumps(note, ensure_ascii=False))
+                logger.debug(
+                    "RPC chat.process: sent non-text event type={} id={}",
+                    evt.get("type"),
+                    request_id,
+                )
 
         # Flush any pending coalesced text, then final result
         if coalesce_enabled:
@@ -301,6 +316,9 @@ async def _handle_chat_process(
                 pass
             await _flush_pending()
         result = {"text": "".join(agg_text)}
+        logger.info(
+            "RPC chat.process: completed id={} text_len={}", request_id, len(result["text"])
+        )
         resp = _rpc_response_ok(request_id, result)
         async with send_lock:
             await websocket.send(json.dumps(resp, ensure_ascii=False))
@@ -359,6 +377,9 @@ async def _connection_handler(websocket):
             if method == "ping":
                 async with send_lock:
                     await websocket.send(json.dumps(_rpc_response_ok(req_id, {"pong": True})))
+                logger.debug(
+                    "RPC ping: replied id={} remote={}", req_id, getattr(websocket, "remote_address", None)
+                )
                 continue
 
             if method == "chat.process":
@@ -371,6 +392,7 @@ async def _connection_handler(websocket):
                         inflight.pop(rid, None)
                     task.add_done_callback(_done_cb)
                 # For None id, we still run the task without mapping
+                logger.info("RPC chat.process: started id={}", req_id)
                 continue
 
             if method == "chat.cancel":
@@ -378,6 +400,7 @@ async def _connection_handler(websocket):
                 if target_id is None:
                     async with send_lock:
                         await websocket.send(json.dumps(_rpc_response_error(req_id, -32602, "Invalid params: request_id required")))
+                    logger.warning("RPC chat.cancel: invalid params id={} params={}", req_id, params)
                     continue
                 inf = inflight.get(target_id)
                 had = inf is not None
@@ -385,6 +408,7 @@ async def _connection_handler(websocket):
                     inf.task.cancel()
                 async with send_lock:
                     await websocket.send(json.dumps(_rpc_response_ok(req_id, {"cancelled": bool(had), "request_id": target_id})))
+                logger.info("RPC chat.cancel: replied cancelled={} target_id={} id={}", bool(had), target_id, req_id)
                 continue
 
             if method == "chat.tool_response":
@@ -392,6 +416,7 @@ async def _connection_handler(websocket):
                 if not isinstance(params, dict):
                     async with send_lock:
                         await websocket.send(json.dumps(_rpc_response_error(req_id, -32602, "Invalid params")))
+                    logger.warning("RPC chat.tool_response: invalid params (not dict) id={} params_type={}", req_id, type(params))
                     continue
                 target_id = params.get("request_id")
                 name = params.get("name")
@@ -400,6 +425,7 @@ async def _connection_handler(websocket):
                 if target_id is None or not isinstance(name, str) or not isinstance(response, dict):
                     async with send_lock:
                         await websocket.send(json.dumps(_rpc_response_error(req_id, -32602, "Invalid params: request_id,name,response required")))
+                    logger.warning("RPC chat.tool_response: invalid fields id={} params={}", req_id, params)
                     continue
                 inf = inflight.get(target_id)
                 accepted = False
@@ -415,6 +441,7 @@ async def _connection_handler(websocket):
                         accepted = False
                 async with send_lock:
                     await websocket.send(json.dumps(_rpc_response_ok(req_id, {"accepted": accepted, "request_id": target_id})))
+                logger.info("RPC chat.tool_response: accepted={} target_id={} id={}", accepted, target_id, req_id)
                 continue
 
             # Unknown method
@@ -422,7 +449,7 @@ async def _connection_handler(websocket):
                 await websocket.send(json.dumps(_rpc_response_error(req_id, -32601, f"Method not found: {method}")))
 
     except websockets.exceptions.ConnectionClosed:
-        logger.info("WS JSON-RPC: connection closed")
+        logger.info("WS JSON-RPC: connection closed for {}", getattr(websocket, "remote_address", None))
     finally:
         # Cancel any remaining tasks
         for inf in list(inflight.values()):
@@ -439,6 +466,8 @@ async def _connection_handler(websocket):
 async def main(host: str = "127.0.0.1", port: int = 8765):
     load_dotenv()
     logger.info("Starting JSON-RPC over WS server on ws://{}:{}", host, port)
+    logger.info("Allowed JSON-RPC methods: {}", ", ".join(["ping", "chat.process", "chat.cancel", "chat.tool_response"]))
+    logger.info("Stream options supported: suppress_whitespace, coalesce_chars, coalesce_time_ms")
     async with websockets.serve(_connection_handler, host, port):
         await asyncio.Future()  # run forever
 

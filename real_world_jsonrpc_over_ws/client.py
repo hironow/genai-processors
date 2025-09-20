@@ -7,6 +7,7 @@ from typing import Any
 import argparse
 
 import websockets
+from loguru import logger
 
 
 def _rpc_request(id_: Any, method: str, params: dict | None = None) -> dict:
@@ -22,7 +23,15 @@ async def run_demo(
     coalesce_chars: int = 0,
     coalesce_time_ms: int = 0,
 ):
+    logger.info(
+        "Client connecting to {} (opts: suppress_ws={} coalesce_chars={} coalesce_time_ms={})",
+        url,
+        suppress_whitespace,
+        coalesce_chars,
+        coalesce_time_ms,
+    )
     async with websockets.connect(url) as ws:
+        logger.info("Client connected to {}", url)
         req = _rpc_request(
             request_id,
             "chat.process",
@@ -38,7 +47,7 @@ async def run_demo(
             },
         )
         await ws.send(json.dumps(req, ensure_ascii=False))
-        print(f"-> {json.dumps(req, ensure_ascii=False)}")
+        logger.info("-> chat.process sent id={} text_len={} ", request_id, len(text))
 
         # Receive notifications (chat.chunk) until final response with id==req_id
         while True:
@@ -50,17 +59,17 @@ async def run_demo(
                 continue
             if "id" in msg and msg.get("id") == request_id:
                 if "error" in msg:
-                    print("<- error:", json.dumps(msg.get("error"), ensure_ascii=False, indent=2))
+                    logger.error("<- error id={} {}", request_id, json.dumps(msg.get("error"), ensure_ascii=False))
                 else:
-                    print("<- result:", json.dumps(msg.get("result"), ensure_ascii=False, indent=2))
+                    logger.info("<- result id={} {}", request_id, json.dumps(msg.get("result"), ensure_ascii=False))
                 break
             if msg.get("method") == "chat.chunk":
                 evt = msg.get("params", {}).get("event", {})
                 t = evt.get("type")
                 if t == "text":
-                    print(f"<- chunk(text): {evt.get('text')}")
+                    logger.debug("<- chunk(text) len={}", len(evt.get("text") or ""))
                 else:
-                    print(f"<- chunk({t}): {json.dumps(evt)[:200]}")
+                    logger.debug("<- chunk({})", t)
 
 
 if __name__ == "__main__":
@@ -87,6 +96,7 @@ if __name__ == "__main__":
 # Test-friendly helper that performs one chat.process and returns all chunks and final message.
 async def rpc_chat(url: str, messages: list[dict[str, Any]], *, request_id: int = 1, timeout: float = 5.0):
     notes: list[dict[str, Any]] = []
+    logger.debug("rpc_chat: connect {} id={}", url, request_id)
     async with websockets.connect(url) as ws:
         req = _rpc_request(request_id, "chat.process", {"messages": messages})
         await ws.send(json.dumps(req, ensure_ascii=False))
@@ -119,6 +129,7 @@ async def rpc_cancel_ws(ws, *, cancel_rpc_id: int, request_id: int):
       cancel_rpc_id: JSON-RPC id for the cancellation request.
       request_id: the original chat.process request id to cancel.
     """
+    logger.debug("rpc_cancel_ws: request cancel target_id={} id={}", request_id, cancel_rpc_id)
     await rpc_send_ws(ws, cancel_rpc_id, "chat.cancel", {"request_id": request_id})
 
 
@@ -126,4 +137,5 @@ async def rpc_tool_response_ws(ws, *, ack_id: int, request_id: int, name: str, r
     params = {"request_id": request_id, "name": name, "response": response}
     if id is not None:
         params["id"] = id
+    logger.debug("rpc_tool_response_ws: send tool_response name={} target_id={} id={}", name, request_id, ack_id)
     await rpc_send_ws(ws, ack_id, "chat.tool_response", params)
