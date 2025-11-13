@@ -23,6 +23,7 @@ keywords = []
 # Installed locally with `pip install -e .`
 dependencies = [
     "absl-py>=1.0.0",
+    "bs4>=0.0.2",
     "dataclasses-json>=0.6.0",
     "google-genai>=1.16.0",
     "google-api-python-client>=0.6.0",
@@ -56,6 +57,7 @@ contrib = [
 # Development deps (unittest, linting, formating,...)
 # Installed through `pip install -e .[dev]`
 dev = [
+    "aiosqlite",
     "pytest",
     "pytest-xdist",
     "pylint>=2.6.0",
