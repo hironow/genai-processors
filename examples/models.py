@@ -25,12 +25,15 @@ to demonstrate that examples can run with various backends.
 
 import enum
 import os
+from typing import Any, Callable
+
 from absl import flags
 from genai_processors import content_api
 from genai_processors import processor
 from genai_processors.contrib.langchain_model import LangChainModel
 from genai_processors.core import genai_model
 from genai_processors.core import ollama_model
+from genai_processors.core import transformers_model
 from google.genai import types as genai_types
 import langchain_google_genai
 
@@ -41,6 +44,7 @@ class _ModelType(enum.Enum):
   GEMINI = 'gemini'
   OLLAMA = 'ollama'
   LANGCHAIN = 'langchain'
+  TRANSFORMERS = 'transformers'
 
 
 _MODEL_TYPE = flags.DEFINE_enum(
@@ -62,6 +66,7 @@ API_KEY = os.environ['GOOGLE_API_KEY']
 
 def turn_based_model(
     system_instruction: content_api.ProcessorContentTypes,
+    tools: list[genai_types.Tool | Callable[..., Any]] | None = None,
 ) -> processor.Processor:
   """Returns a turn-based model based on command line flags.
 
@@ -96,7 +101,9 @@ def turn_based_model(
             # Adds google search as a tool. This is not needed for the model to
             # work but it is useful to ask questions that can be answered by
             # google search.
-            tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())],
+            tools=tools
+            if tools is not None
+            else [genai_types.Tool(google_search=genai_types.GoogleSearch())],
         ),
         # Make the newest features available for the examples.
         http_options=genai_types.HttpOptions(api_version='v1alpha'),
@@ -108,7 +115,8 @@ def turn_based_model(
     return ollama_model.OllamaModel(
         model_name=model_name,
         generate_content_config=ollama_model.GenerateContentConfig(
-            system_instruction=system_instruction
+            system_instruction=system_instruction,
+            tools=tools,
         ),
     )
 
@@ -117,5 +125,16 @@ def turn_based_model(
       model_name = 'gemini-2.0-flash-lite'
     llm = langchain_google_genai.ChatGoogleGenerativeAI(model=model_name)
     return LangChainModel(model=llm, system_instruction=system_instruction)
+
+  if _MODEL_TYPE.value == _ModelType.TRANSFORMERS.value:
+    if not model_name:
+      model_name = 'google/gemma-2b'
+    return transformers_model.TransformersModel(
+        model_name=model_name,
+        generate_content_config=transformers_model.GenerateContentConfig(
+            system_instruction=system_instruction,
+            tools=tools,
+        ),
+    )
 
   raise ValueError(f'{_MODEL_TYPE.value!r} is not supported.')
